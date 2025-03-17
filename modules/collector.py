@@ -1,127 +1,151 @@
-import os
-import csv
 import win32evtlog  # Windows Event Log API
 import win32evtlogutil
 import sqlite3
+import csv
+import json
+import re
 
-# Database path
-db_path = 'Logs.db'
-
-# Ensure output directory for CSV logs exists
-output_dir = "logs"
-os.makedirs(output_dir, exist_ok=True)
-
-# Log categories mapping
-log_categories = {
+# Define log categories to extract
+LOG_CATEGORIES = {
     "Application": "Application",
     "System": "System",
     "Security": "Security",
     "Firewall": "Microsoft-Windows-Windows Firewall With Advanced Security/Firewall",
-    "FirewallVerbose": "Microsoft-Windows-Windows Firewall With Advanced Security/FirewallVerbose",
     "Network": "Microsoft-Windows-NetworkProfile/Operational",
-    "NetworkSecurity": "Microsoft-Windows-NetworkSecurity/Debug",
     "Defender": "Microsoft-Windows-Windows Defender/Operational"
 }
 
-# CSV file paths for all log categories
-csv_files = {category: os.path.join(output_dir, f"{category}_logs.csv") for category in log_categories}
+# Define a standard structure for all logs
+LOG_HEADERS = [
+    "EventID", "LogName", "SourceName", "TimeGenerated", "Category",
+    "EventType", "User", "ComputerName", "Message",
+    "ProcessID", "SessionID", "IPAddress", "AdditionalData"
+]
 
-def create_table_if_not_exists(table_name):
-    """Creates an SQLite table if it does not exist."""
-    conn = sqlite3.connect(db_path)
+def initialize_db():
+    """Initialize the SQLite database and create tables for each log category."""
+    conn = sqlite3.connect("database/logs.db")
     cursor = conn.cursor()
-    cursor.execute(f'''
-        CREATE TABLE IF NOT EXISTS "{table_name}" (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_id INTEGER,
-            source_name TEXT,
-            time_generated TEXT,
-            category INTEGER,
-            type INTEGER,
-            message TEXT
-        )
-    ''')
+    for category in LOG_CATEGORIES.keys():
+        table_name = category.replace("-", "_").replace("/", "_")
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                EventID INTEGER,
+                LogName TEXT,
+                SourceName TEXT,
+                TimeGenerated TEXT,
+                Category TEXT,
+                EventType TEXT,
+                User TEXT,
+                ComputerName TEXT,
+                Message TEXT,
+                ProcessID TEXT,
+                SessionID TEXT,
+                IPAddress TEXT,
+                AdditionalData TEXT
+            )
+        ''')
     conn.commit()
     conn.close()
 
-def insert_logs_to_db(logs, table_name):
-    """Inserts extracted logs into the SQLite database."""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.executemany(f'''
-        INSERT INTO "{table_name}" (event_id, source_name, time_generated, category, type, message)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', [
-        (
-            log['EventID'],
-            log['SourceName'],
-            log['TimeGenerated'],
-            log['Category'],
-            log['Type'],
-            log['Message']
-        ) for log in logs
-    ])
-    conn.commit()
-    conn.close()
-
-def save_logs_to_csv(logs, csv_path):
-    """Saves extracted logs into a CSV file."""
-    if not logs:
-        return
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file)
-        writer.writerow(["EventID", "SourceName", "TimeGenerated", "Category", "Type", "Message"])
-        for log in logs:
-            writer.writerow([
-                log['EventID'],
-                log['SourceName'],
-                log['TimeGenerated'],
-                log['Category'],
-                log['Type'],
-                log['Message']
-            ])
-
-    print(f"✅ Logs saved in {csv_path}")
-
-def extract_logs(log_type, table_name, csv_path, max_events=100):
-    """Extracts Windows Event Logs, saves them in the database, and writes to CSV."""
+def extract_logs(log_type, max_events=100):
+    """Extract logs from the specified Windows event log category."""
     logs = []
     try:
         hand = win32evtlog.OpenEventLog(None, log_type)
         flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
         
-        total_events = win32evtlog.GetNumberOfEventLogRecords(hand)
-        print(f"Extracting {log_type} logs... Total Events Found: {total_events}")
-
         while True:
             events = win32evtlog.ReadEventLog(hand, flags, 0)
             if not events:
                 break
-
+            
             for event in events[:max_events]:
-                evt_data = {
-                    "EventID": event.EventID & 0x1FFFFFFF,
-                    "SourceName": event.SourceName,
-                    "TimeGenerated": event.TimeGenerated.Format(),
-                    "Category": event.EventCategory,
-                    "Type": event.EventType,
-                    "Message": win32evtlogutil.SafeFormatMessage(event, log_type)
-                }
-                logs.append(evt_data)
-
+                try:
+                    evt_data = {
+                        "EventID": event.EventID & 0x1FFFFFFF,
+                        "LogName": log_type,
+                        "SourceName": event.SourceName,
+                        "TimeGenerated": event.TimeGenerated.Format(),
+                        "Category": event.EventCategory,
+                        "EventType": event.EventType,
+                        "User": getattr(event, 'UserName', "N/A"),
+                        "ComputerName": getattr(event, 'ComputerName', "N/A"),
+                        "Message": win32evtlogutil.SafeFormatMessage(event, log_type),
+                        "ProcessID": getattr(event, 'ProcessID', "N/A"),
+                        "SessionID": getattr(event, 'SessionID', "N/A"),
+                        "IPAddress": extract_ip_from_message(win32evtlogutil.SafeFormatMessage(event, log_type)),
+                        "AdditionalData": json.dumps(extract_additional_data(event), default=str)
+                    }
+                    logs.append(evt_data)
+                except Exception as e:
+                    print(f"❌ Error processing event in {log_type}: {e}")
     except Exception as e:
         print(f"Error reading {log_type} logs: {e}")
-
     finally:
         win32evtlog.CloseEventLog(hand)
+    return logs
 
-    if logs:
-        insert_logs_to_db(logs, table_name)
-        save_logs_to_csv(logs, csv_path)
-        print(f"✅ Logs for {log_type} saved in Logs.db under '{table_name}' table.")
+def extract_ip_from_message(message):
+    """Extract IP address if available in the log message."""
+    ip_match = re.search(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', message)
+    return ip_match.group() if ip_match else "N/A"
+
+def extract_additional_data(event):
+    """Extract additional event-specific attributes."""
+    additional_fields = {}
+    for attr in dir(event):
+        if not attr.startswith('_') and attr not in LOG_HEADERS:
+            additional_fields[attr] = getattr(event, attr, "N/A")
+    return additional_fields if additional_fields else "N/A"
+
+def save_logs_to_db(logs, table_name):
+    """Save logs into the SQLite database under the appropriate table."""
+    conn = sqlite3.connect("database/logs.db")
+    cursor = conn.cursor()
+    
+    for log in logs:
+        cursor.execute(f'''
+            INSERT INTO {table_name} (
+                EventID, LogName, SourceName, TimeGenerated, Category,
+                EventType, User, ComputerName, Message,
+                ProcessID, SessionID, IPAddress, AdditionalData
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', tuple(log.values()))
+    
+    conn.commit()
+    conn.close()
+
+def save_logs_to_csv(logs, filename="logs/Unified_Logs.csv"):
+    """Save the extracted logs to a CSV file."""
+    try:
+        with open(filename, mode="w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=LOG_HEADERS)
+            writer.writeheader()
+            writer.writerows(logs)
+        print(f"✅ Logs saved successfully to {filename}")
+    except Exception as e:
+        print(f"❌ Error saving logs to CSV: {e}")
+
+def save_logs_to_json(logs, filename="logs/Unified_Logs.json"):
+    """Save the extracted logs to a JSON file."""
+    try:
+        with open(filename, mode="w", encoding="utf-8") as file:
+            json.dump(logs, file, indent=4, default=str)
+        print(f"✅ Logs saved successfully to {filename}")
+    except Exception as e:
+        print(f"❌ Error saving logs to JSON: {e}")
 
 if __name__ == "__main__":
-    for table_name, log_type in log_categories.items():
-        create_table_if_not_exists(table_name)
-        extract_logs(log_type, table_name, csv_files[table_name])
+    initialize_db()
+    all_logs = []
+    
+    for category_name, event_log in LOG_CATEGORIES.items():
+        print(f"🔍 Extracting logs from: {category_name}")
+        logs = extract_logs(event_log)
+        table_name = category_name.replace("-", "_").replace("/", "_")
+        save_logs_to_db(logs, table_name)
+        all_logs.extend(logs)
+    
+    save_logs_to_csv(all_logs)
+    save_logs_to_json(all_logs)
