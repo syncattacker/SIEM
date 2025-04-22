@@ -1,90 +1,24 @@
 import win32evtlog  # Windows Event Log API
 import win32evtlogutil
-import sqlite3
-import csv
 import json
 import re
+import time
+from categorizer import categorize_log  # Make sure you have a categorize_log function in your categorizer module
+from correlation import initialize_db, enrich_and_store_logs  # Import the function from your second script
 
 # Define log categories to extract
 LOG_CATEGORIES = {
     "Application": "Application",
     "System": "System",
     "Security": "Security",
-    "Firewall": "Microsoft-Windows-Windows Firewall With Advanced Security/Firewall",
-    "Network": "Microsoft-Windows-NetworkProfile/Operational",
-    "Defender": "Microsoft-Windows-Windows Defender/Operational"
 }
 
-# Define a standard structure for all logs
+# Define log headers for structured log data
 LOG_HEADERS = [
     "EventID", "LogName", "SourceName", "TimeGenerated", "Category",
     "EventType", "User", "ComputerName", "Message",
     "ProcessID", "SessionID", "IPAddress", "AdditionalData"
 ]
-
-def initialize_db():
-    """Initialize the SQLite database and create tables for each log category."""
-    conn = sqlite3.connect("database/logs.db")
-    cursor = conn.cursor()
-    for category in LOG_CATEGORIES.keys():
-        table_name = category.replace("-", "_").replace("/", "_")
-        cursor.execute(f'''
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                EventID INTEGER,
-                LogName TEXT,
-                SourceName TEXT,
-                TimeGenerated TEXT,
-                Category TEXT,
-                EventType TEXT,
-                User TEXT,
-                ComputerName TEXT,
-                Message TEXT,
-                ProcessID TEXT,
-                SessionID TEXT,
-                IPAddress TEXT,
-                AdditionalData TEXT
-            )
-        ''')
-    conn.commit()
-    conn.close()
-
-def extract_logs(log_type, max_events=100):
-    """Extract logs from the specified Windows event log category."""
-    logs = []
-    try:
-        hand = win32evtlog.OpenEventLog(None, log_type)
-        flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
-        
-        while True:
-            events = win32evtlog.ReadEventLog(hand, flags, 0)
-            if not events:
-                break
-            
-            for event in events[:max_events]:
-                try:
-                    evt_data = {
-                        "EventID": event.EventID & 0x1FFFFFFF,
-                        "LogName": log_type,
-                        "SourceName": event.SourceName,
-                        "TimeGenerated": event.TimeGenerated.Format(),
-                        "Category": event.EventCategory,
-                        "EventType": event.EventType,
-                        "User": getattr(event, 'UserName', "N/A"),
-                        "ComputerName": getattr(event, 'ComputerName', "N/A"),
-                        "Message": win32evtlogutil.SafeFormatMessage(event, log_type),
-                        "ProcessID": getattr(event, 'ProcessID', "N/A"),
-                        "SessionID": getattr(event, 'SessionID', "N/A"),
-                        "IPAddress": extract_ip_from_message(win32evtlogutil.SafeFormatMessage(event, log_type)),
-                        "AdditionalData": json.dumps(extract_additional_data(event), default=str)
-                    }
-                    logs.append(evt_data)
-                except Exception as e:
-                    print(f"❌ Error processing event in {log_type}: {e}")
-    except Exception as e:
-        print(f"Error reading {log_type} logs: {e}")
-    finally:
-        win32evtlog.CloseEventLog(hand)
-    return logs
 
 def extract_ip_from_message(message):
     """Extract IP address if available in the log message."""
@@ -99,53 +33,73 @@ def extract_additional_data(event):
             additional_fields[attr] = getattr(event, attr, "N/A")
     return additional_fields if additional_fields else "N/A"
 
-def save_logs_to_db(logs, table_name):
-    """Save logs into the SQLite database under the appropriate table."""
-    conn = sqlite3.connect("database/logs.db")
-    cursor = conn.cursor()
-    
-    for log in logs:
-        cursor.execute(f'''
-            INSERT INTO {table_name} (
-                EventID, LogName, SourceName, TimeGenerated, Category,
-                EventType, User, ComputerName, Message,
-                ProcessID, SessionID, IPAddress, AdditionalData
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', tuple(log.values()))
-    
-    conn.commit()
-    conn.close()
+def monitor_logs():
+    flags = win32evtlog.EVENTLOG_SEQUENTIAL_READ | win32evtlog.EVENTLOG_FORWARDS_READ
+    handles = {}
+    record_numbers = {log: 0 for log in LOG_CATEGORIES.values()}
 
-def save_logs_to_csv(logs, filename="logs/Unified_Logs.csv"):
-    """Save the extracted logs to a CSV file."""
-    try:
-        with open(filename, mode="w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=LOG_HEADERS)
-            writer.writeheader()
-            writer.writerows(logs)
-        print(f"✅ Logs saved successfully to {filename}")
-    except Exception as e:
-        print(f"❌ Error saving logs to CSV: {e}")
+    # Open event logs only if they exist
+    for log_type, event_log in LOG_CATEGORIES.items():
+        try:
+            handles[log_type] = win32evtlog.OpenEventLog(None, event_log)
+        except Exception as e:
+            print(f"⚠️ Error opening {event_log}: {e}")
+            handles[log_type] = None
 
-def save_logs_to_json(logs, filename="logs/Unified_Logs.json"):
-    """Save the extracted logs to a JSON file."""
+    print("🚀 Real-time log collection started...")
     try:
-        with open(filename, mode="w", encoding="utf-8") as file:
-            json.dump(logs, file, indent=4, default=str)
-        print(f"✅ Logs saved successfully to {filename}")
-    except Exception as e:
-        print(f"❌ Error saving logs to JSON: {e}")
+        while True:
+            for log_type, event_log in LOG_CATEGORIES.items():
+                if handles[log_type] is None:  # Skip logs with no handle
+                    continue
+
+                events = win32evtlog.ReadEventLog(handles[log_type], flags, record_numbers[log_type])
+                if not events:
+                    continue
+
+                categorized_logs = []  # Collect categorized logs
+
+                for event in events:
+                    try:
+                        event_id = event.EventID & 0x1FFFFFFF
+                        message = win32evtlogutil.SafeFormatMessage(event, event_log)
+                        log_data = {
+                            "EventID": event_id,
+                            "LogName": event_log,
+                            "SourceName": event.SourceName,
+                            "TimeGenerated": event.TimeGenerated.Format(),
+                            "Category": event.EventCategory,
+                            "EventType": event.EventType,
+                            "User": getattr(event, 'UserName', "N/A"),
+                            "ComputerName": getattr(event, 'ComputerName', "N/A"),
+                            "Message": message,
+                            "ProcessID": getattr(event, 'ProcessID', "N/A"),
+                            "SessionID": getattr(event, 'SessionID', "N/A"),
+                            "IPAddress": extract_ip_from_message(message),
+                            "AdditionalData": json.dumps(extract_additional_data(event), default=str),
+                        }
+
+                        # Pass the log data to categorize_log function
+                        categorized = categorize_log(event_id, log_data)
+                        categorized_logs.append(categorized)  # Add to the categorized logs list
+
+                    except Exception as err:
+                        print(f"⚠️ Error processing log in {event_log}: {err}")
+                
+                # Once all logs are processed, enrich and store them in the database
+                if categorized_logs:
+                    initialize_db()
+                    enrich_and_store_logs(categorized_logs)  # Pass categorized logs to the database function
+
+                record_numbers[log_type] += len(events)
+
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("\n⛔ Stopped log monitoring.")
+    finally:
+        for handle in handles.values():
+            if handle:
+                win32evtlog.CloseEventLog(handle)
 
 if __name__ == "__main__":
-    initialize_db()
-    all_logs = []
-    
-    for category_name, event_log in LOG_CATEGORIES.items():
-        print(f"🔍 Extracting logs from: {category_name}")
-        logs = extract_logs(event_log)
-        table_name = category_name.replace("-", "_").replace("/", "_")
-        save_logs_to_db(logs, table_name)
-        all_logs.extend(logs)
-    
-    save_logs_to_csv(all_logs)
-    save_logs_to_json(all_logs)
+    monitor_logs()
