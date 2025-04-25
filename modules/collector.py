@@ -3,8 +3,8 @@ import win32evtlogutil
 import json
 import re
 import time
-from categorizer import categorize_log  # Make sure you have a categorize_log function in your categorizer module
-from correlation import initialize_db, enrich_and_store_logs  # Import the function from your second script
+from categorizer import categorize_log 
+from correlation import initialize_db, enrich_and_store_logs  # Imported function from second script
 
 # Define log categories to extract
 LOG_CATEGORIES = {
